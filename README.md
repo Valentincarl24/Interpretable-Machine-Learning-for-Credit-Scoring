@@ -1,2 +1,1 @@
-# thesis_IML
-Interpretable Machine Learning for Credit Scoring
+# Interpretable Machine Learning for Credit Scoring
