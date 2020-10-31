@@ -1,0 +1,246 @@
+---
+title: "IML_thesis"
+author: "Valentin Carl"
+date: "10/19/2020"
+output: html_document
+---
+
+## background
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# setting working directory
+knitr::opts_knit$set(root.dir = '/Users/valentincarl/R/BACHELORARBEIT')
+
+# seed for reproducability
+set.seed(24)
+```
+
+```{r packages, include = FALSE}
+#install.packages(c("tidyverse", "mlr", "iml", "randomForest", "corrplot", "DescTools", "Metrics"))
+
+library(tidyverse)
+library(mlr)
+library(iml)
+library(randomForest)
+library(corrplot)
+library(DescTools)
+library(Metrics)
+```
+
+## data
+
+```{r importing data, include = FALSE}
+# importing data
+credit_data <- read_csv("Data/Give_me_some_credit_Kaggle/cs-training.csv", col_types = cols(SeriousDlqin2yrs = col_factor(levels = c("0", "1")), X1 = col_skip()))
+```
+
+```{r data wrangling I, echo = FALSE}
+# summary statistics for all variables
+summary(credit_data)
+```
+
+```{r data wrangling II, include = FALSE}
+# replaing NAs by the respective mean for .$MonthlyIncome and .$NumberOfDependents
+mean_MonthlyIncome <- mean(credit_data$MonthlyIncome, na.rm = TRUE)
+mean_NumberOfDependents <- mean(credit_data$NumberOfDependents, na.rm = TRUE)
+for(i in 1:nrow(credit_data)){
+  if(is.na(credit_data$MonthlyIncome[i])){
+    credit_data$MonthlyIncome[i] <-  mean_MonthlyIncome
+  }
+}
+for(i in 1:nrow(credit_data)){
+  if(is.na(credit_data$NumberOfDependents[i])){
+    credit_data$NumberOfDependents[i] <-  mean_NumberOfDependents
+  }
+}
+
+# replacing .$age == 0 by the mean
+mean_age <- mean(credit_data$age)
+credit_data$age[credit_data$age == 0] <- mean_age
+
+# removing temporary variables
+rm(i, mean_MonthlyIncome, mean_age, mean_NumberOfDependents)
+```
+
+```{r corr plot}
+# correlations
+temp_data <- credit_data
+names(temp_data) 
+names(temp_data) <- c("Default", "RevUtil", "Age", "No30.59", "DebtRatio", "MonthlyIncome", "OpenCredits", "No90", "NoRealEst", "No60.89", "NoDependents")
+temp_data <- temp_data %>%
+  select(Default, RevUtil, Age, NoDependents, MonthlyIncome, DebtRatio, OpenCredits, NoRealEst, No30.59, No60.89, No90)
+correlations <- cor(temp_data[, 2:11])
+round(correlations, 2)
+
+# plot
+corrplot(correlations, method = "number", tl.col = "black", tl.srt = 45)
+```
+
+```{r data wrangling III}
+# creating new variables
+credit_data <- credit_data %>%
+  mutate(NumberOfRealEstateLoansAndOpenCreditLines = NumberRealEstateLoansOrLines + NumberOfOpenCreditLinesAndLoans,
+         NumberOfTimes30DaysOrMoreLate = NumberOfTime30.59DaysPastDueNotWorse + NumberOfTime60.89DaysPastDueNotWorse + NumberOfTimes90DaysLate)
+
+# omitting the now redundant variables
+credit_data <-  credit_data %>%
+  select(SeriousDlqin2yrs, RevolvingUtilizationOfUnsecuredLines, age, NumberOfDependents, MonthlyIncome, DebtRatio, NumberOfRealEstateLoansAndOpenCreditLines, NumberOfTimes30DaysOrMoreLate)
+
+summary(credit_data)
+```
+
+## iml
+
+### (1) global surrogate with logit
+
+```{r (1) Random forest}
+# using mlr to train a random forest
+credit_task <- makeClassifTask(id = "creditTask", credit_data, target = "SeriousDlqin2yrs", positive = "1")
+
+# creating ids to split test/training set
+training_set <- 1:100000
+test_set <- 100001:nrow(credit_data)
+
+# creating learner
+learner_rforest <- makeLearner("classif.randomForest", predict.type = "prob")
+
+# training model
+model_rforest <- mlr::train(learner_rforest, credit_task, subset = training_set)
+model_rforest$task.desc
+getLearnerModel(model_rforest)
+
+# making predictions with the random forest model
+predictions_rforest <- predict(model_rforest, credit_task, subset = test_set)
+head(predictions_rforest$data)
+
+# confusion matrix for test set predictions
+calculateConfusionMatrix(predictions_rforest)
+
+# generating & plotting ROC-curve
+df = generateThreshVsPerfData(predictions_rforest, measures = list(fpr, tpr))
+plotROCCurves(df)
+```
+
+```{r (1) Surrogate -- Logit}
+# creating a second data frame from which to use logit on to explain the predictions made by the random forest model
+predictions_rf_response <- data.frame(id = test_set, prediction = predictions_rforest$data$response)
+credit_data <- credit_data %>% mutate(id = 1:nrow(credit_data))
+second_df <- inner_join(credit_data, predictions_rf_response, by = "id")
+second_df <- second_df %>%
+  select(prediction, RevolvingUtilizationOfUnsecuredLines, age, NumberOfDependents, MonthlyIncome, DebtRatio, NumberOfRealEstateLoansAndOpenCreditLines, NumberOfTimes30DaysOrMoreLate)
+credit_data <- credit_data %>% select(-id)
+head(second_df)
+
+# => col 'id' removed from 2nd data frame, row numbers 1 to 50,000 are equivalent to row numers 100,001 to 150,000 in credit_data
+
+
+# using MLR to create a global surrogate model
+
+# new task
+logit_surrogate_task <- makeClassifTask(id = "logitSurrogateTask", second_df, target = "prediction", positive = "1")
+
+# new learner
+learner_logit <- makeLearner("classif.logreg", predict.type = "prob")
+
+# new model
+surrogate_model_logit <- mlr::train(learner_logit, logit_surrogate_task)
+surrogate_model_logit$task.desc
+
+# getting the values for the logit coefficients
+getLearnerModel(surrogate_model_logit)
+summary(getLearnerModel(surrogate_model_logit))
+
+# performance measures
+pred_surr_logit <- predict(surrogate_model_logit, logit_surrogate_task)
+#performance(pred_surr_logit, measures = list(acc, auc))
+head(pred_surr_logit)
+calculateConfusionMatrix(pred_surr_logit)
+
+
+# Using glm() to create a 2nd LR model compatible with the DescTools package, logit2 is identical to surrogate_model_logit
+
+# model
+logit2 <- glm(prediction ~ ., data = second_df, family = "binomial")
+summary(logit2)
+logit2_predictions_z_hat <- predict(logit2)
+logit2_predictions <- 1/(1+exp((-1)*logit2_predictions_z_hat))
+# measuring the goodness of fit of the surrogate model
+PseudoR2(logit2, "McFadden")
+
+# creating standardised beta-values in order to enable comparability
+S_y <- sd(as.numeric(credit_data$SeriousDlqin2yrs))
+S_x <- vector(length = 7)
+for(i in 1:7){
+  j <- i+1
+  S_x[i] <- sapply(credit_data[,j], sd)
+}
+
+B_x <- logit2$coefficients
+Beta_sd <- vector(length = 7)
+for(i in 1:7){
+  Beta_sd[i] <- B_x[i+1]*S_x[i]/S_y
+}
+
+coefficients_df <- data.frame(regression_coefficients = B_x[2:length(B_x)], standardised_coefficients = Beta_sd)
+coefficients_df <- round(coefficients_df, 6)
+absolute_values <- abs(coefficients_df$standardised_coefficients)
+coefficients_df <- coefficients_df %>%
+  mutate(absolute_values)
+row.names(coefficients_df) <- names(B_x[2:8])
+```
+
+### (2) Shapley values
+
+```{r experiment 2 -- Shapley values, RF}
+# model
+rf <- randomForest(formula = credit_data$SeriousDlqin2yrs ~ ., data = credit_data, ntree = 500)
+rf_predictions <- predict(rf, type = "prob")
+View(rf_predictions)
+
+# drawing random instance
+set.seed(213132)
+sample(1:150000, size = 1)
+
+# row which to explain
+x.interest <- credit_data[118747,]
+
+# shapley predictor
+shapley_p <- Predictor$new(rf, credit_data)
+
+# calculating shapley values
+shapley <- Shapley$new(shapley_p, x.interest = x.interest, sample.size = 100)
+
+# plot
+plot(shapley)
+View(x.interest)
+
+# results
+results_shapley <- shapley$results
+results_shapley <- results_shapley[9:nrow(results_shapley),]
+View(results_shapley)
+
+# data frame containing True SeriousDlqin2yrs, RForest prob.1 & response, ID
+linking_df <- data.frame(true_default = credit_data$SeriousDlqin2yrs[100001:150000], rf_pred.1 = predictions_rforest$data$prob.1, rf_response = predictions_rforest$data$response, id = c(1:50000))
+linking_df <- linking_df %>%
+  filter(linking_df$rf_response == 1)
+View(linking_df)
+
+# mean prediction
+mean_prediction <- mean(linking_df$rf_pred.1)
+
+# shapley values: features' contributions to difference between prediction and average prediction
+round(linking_df$rf_pred.1[18747], 2) - round(sum(results_shapley$phi.var), 2) - round(mean(linking_df$rf_pred.1), 2)
+
+# plot 2
+results_shapley[2:8,] %>%
+  select(feature, phi.var) %>%
+  mutate(feature = fct_reorder(feature, phi.var)) %>%
+    ggplot(aes(x = feature, y = phi.var)) +
+      geom_bar(stat="identity", fill="#4287f5", alpha=.8, width=.4) +
+      coord_flip() +
+      xlab("") +
+      ylab("Shapley value") +
+      theme_bw()
+```
